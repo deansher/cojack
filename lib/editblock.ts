@@ -37,8 +37,8 @@ export function findOriginalUpdateBlocks(content: string): EditBlock[] {
   while (i < lines.length) {
     // Look for HEAD_REGEX
     if (HEAD_REGEX.test(lines[i])) {
-      let originalTextLines: string[] = [];
-      let updatedTextLines: string[] = [];
+      const originalTextLines: string[] = [];
+      const updatedTextLines: string[] = [];
       let j = i + 1;
       
       // gather originalText until DIVIDER_REGEX
@@ -104,11 +104,15 @@ export function applyEdits(
     let content: string;
     try {
       content = Deno.readTextFileSync(filePath);
-    } catch {
+    } catch (err) {
       // If file doesn't exist, start with empty content
-      content = "";
+      if (err instanceof Deno.errors.NotFound) {
+        content = "";
+      } else {
+        throw err; // rethrow any other error (e.g., permission denied)
+      }
     }
-    
+       
     const newContent = fuzzyReplace(content, edit.originalText, edit.updatedText);
     if (newContent == null) {
       // Could not find a good match for originalText

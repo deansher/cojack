@@ -1,4 +1,3 @@
-import { serveFile } from "https://deno.land/std@0.188.0/http/file_server.ts";
 import { findOriginalUpdateBlocks, applyEdits } from "./lib/editblock.ts";
 
 interface StartServerOptions {
@@ -6,22 +5,20 @@ interface StartServerOptions {
   accessToken: string;
 }
 
-export async function startServer(
+export function startServer(
   req: Request,
   opts: StartServerOptions
 ): Promise<Response> {
   const url = new URL(req.url);
   const token = url.searchParams.get("token");
-  
-  // Simple auth check
+
   if (token !== opts.accessToken) {
-    return new Response("Invalid token", { status: 401 });
+    return Promise.resolve(new Response("Invalid token", { status: 401 }));
   }
 
-  // Minimal router, to be replaced with a real router/OpenAPI framework
   switch (url.pathname) {
     case "/":
-      return serveOpenAPI();
+      return Promise.resolve(serveOpenAPI());
     case "/find_blocks":
       if (req.method === "POST") {
         return handleFindBlocks(req);
@@ -33,10 +30,10 @@ export async function startServer(
       }
       break;
     default:
-      return new Response("Not Found", { status: 404 });
+      return Promise.resolve(new Response("Not Found", { status: 404 }));
   }
 
-  return new Response("Method Not Allowed", { status: 405 });
+  return Promise.resolve(new Response("Method Not Allowed", { status: 405 }));
 }
 
 // Placeholder for returning an OpenAPI spec
