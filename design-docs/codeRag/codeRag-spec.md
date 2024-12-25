@@ -111,3 +111,137 @@ For these file types, tree-sitter might be replaced or augmented by simpler chun
 2. **Multi-Repo Graph**: A cross-repo reference graph, letting `codeRag` unify code relationships across different projects.  
 3. **Automatic Elision of “Noisy” Blocks**: If repeated boilerplate code appears in many files, automatically detect and omit (unless specifically referenced).  
 4. **Comprehensive Reference Types**: Future expansions could parse not just imports and function calls, but also environment dependencies, build pipeline references, etc.
+
+## 7. MVP Implementation Outline
+
+Below is a concise, step-by-step outline for how `codeRag` can be initially implemented in an MVP capacity, focusing on the core tasks of **chunking**, **embedding**, **storing**, and **retrieving** code. This design aligns with the broader `codeRag` specification but keeps the implementation as simple as possible for immediate functionality.
+
+---
+
+### 7.1 Overview
+
+The MVP algorithm proceeds in **four phases**:
+
+1. **Parse & Chunk**  
+   - Use a code-aware parser (e.g., Tree-Sitter) to walk through each file, extracting top-level declarations (e.g., functions, classes, or methods).  
+   - If a file lacks a recognized structure (like plain text or Markdown), fall back on a simpler “heading-based” or “N-line” splitting approach.  
+   - Build a list of chunks, each with metadata (`filepath`, `lineStart`, `lineEnd`, etc.) and the raw code snippet.  
+
+2. **Embed & Store**  
+   - For each chunk, generate **two** embeddings: one from the raw code snippet, one from a short “commentary” string (if applicable).  
+   - Store these embeddings alongside chunk metadata in RxDB.
+
+3. **Query & Retrieval**  
+   - For an incoming request (i.e., `POST /coderag/query`):
+    - First, decide what portion of the chat history to embed as the semantic key. We may just use the most recent few messages, or have an LLM decide what messages to use.
+     - Then, embed the query content with the same model used to embed chunks.
+   - Perform a **similarity search** to fetch the top-K matching chunks from the index, optionally applying reference expansions if needed (see 7.4 for details).  
+   - Combine the final set of chunks into a `<codeRag:chunk>`-based text block for returning to the caller.
+
+4. **(Optional) PageRank Boost**  
+   - Once the top-K chunks are found, gather chunks that are heavily referenced by these top-K results.  
+   - Add them to the final set if the overall token limit (`approxLength`) permits.
+
+---
+
+### 7.2 Phase 1: Parse & Chunk
+
+1. **Initialize Tree-Sitter**  
+   - Load the grammar for the relevant languages (TypeScript, Python, etc.). For non-supported or simple text files, skip AST-based parsing.  
+   - Optionally maintain a fallback method for files that Tree-Sitter cannot parse.
+
+2. **Extract Top-Level Declarations**  
+   - Identify each function/class/method node.  
+   - Capture the source lines for each node; if a node is larger than a set threshold (e.g., 200 lines), consider splitting it further or eliding internal lines to keep the chunk size manageable.
+
+3. **Build Chunk Metadata**  
+   - For each chunk, store:
+     - `filePath`: relative path in the repo.  
+     - `lineRange`: e.g., `startLine` and `endLine`.  
+     - `references`: minimal set of references (if easily derivable from import statements or function calls).  
+     - `content`: the raw (possibly partially elided) code lines.
+
+4. **Generate Commentary (Optional)**  
+   - If you want short doclike commentary, feed a small prompt to an LLM or implement a static summarizer for each chunk.  
+   - Store this commentary so it can be embedded separately.
+
+---
+
+### 7.3 Phase 2: Embed & Store
+
+1. **Choose an Embedding Model**  
+   - For the MVP, pick a single model (e.g., OpenAI’s `text-embedding-ada-002` or a local open-source alternative).  
+   - Each chunk yields:
+     - `embeddingCode`: an embedding of the raw code snippet.  
+     - `embeddingCommentary`: an embedding of the commentary (if used).
+
+2. **Store in a Simple Index**  
+   - Use either a file-based index (e.g., an on-disk FAISS index or Qdrant running locally) or an in-memory data structure if the repos are small.  
+   - Maintain a simple table or JSON structure linking chunk IDs → embeddings → metadata.
+
+3. **Basic Caching**  
+   - Optionally store partial results in memory (especially if re-indexing is expensive).  
+   - If `POST /coderag/refresh` is called, drop or rebuild these entries for the specified repo.
+
+---
+
+### 7.4 Phase 3: Query & Retrieval
+
+1. **Embed the Query**  
+   - Take the user’s prompt/messages from the request body, construct a single text string or short summary, and get its embedding from the same model.
+
+2. **Nearest-Neighbor Search**  
+   - Query the vector index for the top-N matches, sorted by cosine similarity (or a comparable metric).  
+   - For each returned chunk, retrieve the stored metadata and raw code from your DB/index.
+
+3. **Reference Expansion (Optional)**  
+   - If the user has a “referenceFollow” parameter > 0, gather references from the top-N chunks.  
+   - Pull in additional chunks that are either directly referenced or appear in the same file.  
+   - Make sure the final set doesn’t exceed `approxLength` tokens.
+
+4. **Response Assembly**  
+   - Format the final set of chunks as `<codeRag:chunk>` blocks, each containing `<metadata>`, `<commentary>` (if available), and `<content>`.  
+   - Return them in the `ragText` field of your JSON response.
+
+---
+
+### 7.5 Phase 4: (Optional) PageRank Boost
+
+1. **Build Graph of References**  
+   - For each chunk, you have a list of references (e.g., imported modules, called functions). Build a directed graph connecting chunks.  
+
+2. **Re-Score**  
+   - After obtaining top-N by embedding similarity, run a short link-based scoring pass (like a personalized PageRank) to see which chunks are heavily connected to the top-N.  
+   - Raise the rank of chunks that appear in multiple references.  
+
+3. **Combine & Cap**  
+   - Merge the embedding-based top-N with the top M from PageRank.  
+   - Enforce length constraints so you don’t exceed the `approxLength` limit.
+
+---
+
+### 7.6 Example Data Flow (MVP)
+
+1. **Indexing**  
+   - `POST /coderag/refresh?repoPath=/my/local/repo`  
+   - Cojack scans `/my/local/repo`, calls Tree-Sitter on `.ts`/`.js`/`.py` files, produces chunk objects.  
+   - Each chunk is embedded and stored in your chosen index.
+
+2. **Querying**  
+   - `POST /coderag/query` with `messages: [...], approxLength: 8000`.  
+   - Cojack embeds the query, fetches the top 6–10 chunks, and optionally expands references.  
+   - The chunks are returned as `<codeRag:chunk>` elements in the response `ragText`.
+
+3. **Edits & Shell** (Orthogonal)  
+   - The `/editOne` and `/execShell` endpoints run independently of `codeRag`, though in practice you may want to refresh the index after major edits if the code changed substantially.
+
+---
+
+### 7.7 Summary of MVP Goals
+
+- **Simplicity**: The algorithm avoids heavy complexity—one pass for chunk creation, one pass for indexing, one pass for retrieval.  
+- **Extensibility**: You can add advanced reference analysis or more flexible chunk splitting later.  
+- **Modularity**: Each phase (parse, embed, store, retrieve) is conceptually separate, making debugging easier.  
+- **Low Friction**: For a basic single-repo case, even an in-memory vector index can suffice. Larger deployments can adopt production-grade vector stores or caching strategies.
+
+This MVP flow provides the minimum needed to get `codeRag` functioning for code retrieval tasks while leaving room for incremental improvements—such as multi-language support, more elaborate reference-based expansions, or partial AST rewriting. 
