@@ -141,7 +141,26 @@ We use **RxDB** (initially backed by **DenoKV**) to store file chunks and metada
 
 ### 2.3 Indexing Flow
 
+**Step-by-Step**:
+1. **Repo Detection**: For each repository entry, clone or update the local checkout.
+2. **Chunk Generation**: Split each file into near-top-level declaration chunks via tree-sitter.
+3. **Compute Commentary & Embeddings**: For each chunk, optionally generate commentary (doc summarization) and store both raw text + commentary as separate embeddings.
+4. **Store in Vector DB**: Insert chunk embeddings (and references) into RxDB.
+
 ### 2.4 Query Flow
+
+**Step-by-Step**:
+1. **Receive Query**: Collect the user’s `messages` array, approximate length, and target repos.
+2. **Find Relevant Chunks**:
+   - Use embeddings to search for top-N relevant chunks.
+   - Expand to neighbors by reference in a personalized PageRank approach.
+3. **Assemble Snippet**:
+   - Merge relevant chunks, applying `approxLength` constraints.
+   - Elide unneeded or repeated lines using `. . .`.
+4. **Finalize & Return**:
+   - Format with `<codeRag:chunk>` elements.
+   - Include `metadata` describing which chunks were included or elided.
+   - Return the aggregated text via `ragText`.
 
 ## 3. Phased Roadmap
 
@@ -204,3 +223,83 @@ Following the “Add Relationship Context” plan from `plan_enhance_repomap.md`
 - **Multi-repo support**: orchestrating references across multiple projects.  
 - **Git version references**: retrieving code from specific commits or comparing changes.  
 
+## 4. MVP Security Approach
+
+Cojack’s **initial security** model is intentionally minimal, relying on an **auto-generated token** that is embedded in the service URL. This approach is sufficient for open-source users, individuals, and small teams who are comfortable with a single, broad permission level, and it keeps the user experience extremely simple. Below are the key points of our MVP solution, alongside hints on how we can layer in more robust security while retaining backward compatibility.
+
+### 4.1 Single-User Token Model
+
+- **Startup & Token Generation**  
+  When Cojack starts, it automatically generates a random token and logs a full URL (including `?token=...`) to stdout.
+  - **Example**: `Cojack started! Access: http://<host>:<port>?token=abcdef`
+- **Usage**  
+  Anyone with the URL (and its token) can directly access Cojack’s endpoints. This includes:
+  - **Local Development**: An IDE plugin on the same machine.
+  - **Remote Access**: If Cojack is running on a server exposed to the internet, a cloud-based client can connect.
+
+### 4.2 Deployment Considerations
+
+- **Open Internet vs. Private Network**  
+  - **Open-Source or Small Teams**: May choose to expose Cojack to the public internet for cloud-based workflows, as the simple token-based link is enough for their risk profile.
+  - **Private Network**: For higher security, run Cojack behind a firewall, a VPC, or at least use TLS termination in front of it. The same single-token approach still works as long as the environment restricts traffic to trusted hosts or services.
+- **Token in URL**  
+  - **Advantages**: Printing a fully-formed URL simplifies usage. Users can simply copy-paste the URL wherever needed.  
+  - **Risks**: URLs are sometimes logged or cached by browsers. Users who require stricter controls should take additional security measures (e.g., not logging the URL, rotating tokens, using short lifespans, etc.).
+
+### 4.3 Light Abstraction for a Future Multi-User World
+
+Though Cojack currently supports only one user with a single token, the following design choices make it easier to extend to multiple users and stricter permissions later:
+
+1. **Token → User Mapping**  
+   - Internally, the server has a simple method (`validateToken`) that today always returns the same user object. In the future, this can map each token to a specific user account.
+2. **Repo-Level Authorization Hook**  
+   - Before indexing or querying, the server calls a small “checkAccess” function. For now, it always allows access. If needed later, it could enforce per-repo or per-directory rules.
+3. **Caching Interface**  
+   - Caching of file chunks is encapsulated behind a single interface. It does not enforce user-based separation at the moment. However, it can easily be extended to store user or repo IDs in cache keys if multi-user segregation is needed.
+
+These abstractions allow Cojack to remain simple in the MVP phase, while keeping the door open for more advanced security if user demand or organizational requirements grow.
+
+### 4.4 Potential Future Directions
+
+Looking ahead, organizations or projects that require tighter security or multi-user workflows can build on the MVP with minimal disruption. Below are a few possible enhancements:
+
+1. **User Accounts & Authentication**  
+   - **Token Variations**: Expand the MVP token validation to map tokens → unique user accounts.  
+   - **OAuth / SSO**: Integrate with more robust authentication providers (e.g., GitHub, Google).  
+   - **Session Management**: Support token rotation, token lifespans, or session-based authentication.
+
+2. **Fine-Grained Authorization**  
+   - **Per-Repo Permissions**: Assign roles (e.g., reader, contributor, admin) to each repository.  
+   - **Directory- / File-Level Controls**: Restrict certain paths to specific user groups.  
+
+3. **Auditing & Logging**  
+   - **Query Logs**: Log which queries were made, by whom, and when.  
+   - **Access Trace**: Track which files or chunks are viewed. Useful for compliance or internal audit requirements.
+
+4. **Secure Access Enforcement**  
+   - **Transport Encryption**: Deploy HTTPS/SSL or run behind a reverse proxy with TLS termination.  
+   - **Network Isolation**: For large enterprises, place Cojack behind a VPN or private subnetwork, ensuring only authorized clients can reach it.
+
+5. **Multi-Tenant Caching**  
+   - **Shared Repo Caches**: Let multiple users share the same cache for a common repo, avoiding redundant indexing.  
+   - **User-Specific Variations**: If a repo is private to one user, store caches separately to prevent leakage.
+
+These potential directions illustrate how Cojack’s design can grow into a more robust security solution while preserving backward compatibility with the MVP approach.
+
+## 5. Testing & Validation
+
+### 5.1 Unit Tests
+- **Chunk Parsing**: Validate that tree-sitter extracts top-level declarations properly.
+- **Reference Expansion**: Check that reference-based expansions work for classes, functions, etc.
+- **Elision Rules**: Ensure `. . .` insertion logic is correct for various file types.
+
+### 5.2 Integration Tests
+- **End-to-End**: Spin up the Cojack server, issue a `POST /coderag/query` using a real or mock repo, and validate the `ragText` content.
+- **Concurrency & Load**: Simulate multiple queries in parallel to see if index locking or concurrency issues arise.
+
+### 5.3 Performance Benchmarks
+- **Index Speed**: Measure how long it takes to index large repos.  
+- **Query Latency**: For typical or worst-case queries, track average response time.
+
+### 5.4 Future CI/CD Integration
+- **Automated Pipeline**: Integrate the above tests with a CI system to run on every pull request or commit.
