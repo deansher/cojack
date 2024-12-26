@@ -245,3 +245,115 @@ The MVP algorithm proceeds in **four phases**:
 - **Low Friction**: For a basic single-repo case, even an in-memory vector index can suffice. Larger deployments can adopt production-grade vector stores or caching strategies.
 
 This MVP flow provides the minimum needed to get `codeRag` functioning for code retrieval tasks while leaving room for incremental improvements—such as multi-language support, more elaborate reference-based expansions, or partial AST rewriting. 
+
+## 8. Incorporating Hybrid Lexical & Semantic Search
+
+Recent insights from **Anthropic’s Contextual Retrieval** method, along with older yet proven lexical indexing techniques such as **BM25**, highlight the need to balance semantic similarity with exact keyword matching—particularly when unique identifiers or error codes are present. Below is a proposed addition to the `codeRag` design that addresses precise keyword lookups (especially for code identifiers) alongside embedding-based retrieval, all while leveraging **RxDB** for unified storage.
+
+---
+
+### 8.1 Rationale
+
+1. **Exact Keyword Searches**  
+   - Pure embedding approaches may overlook rare or “low-frequency” terms (e.g., `TS-999`, `myVarXYZ`), since they don’t always factor in literal string matches.  
+   - A BM25 (or TF-IDF) index excels at handling these cases by focusing on token occurrences.
+
+2. **Semantic Similarity**  
+   - Embedding-based queries capture broader, conceptual matches—useful for “explain how function X works” or “find the chunk describing concurrency in this class.”
+
+3. **Hybrid Fusion**  
+   - By combining top results from BM25 with top results from embeddings, then merging or re-ranking them, we maximize coverage.  
+   - “Rank fusion” merges both lists (possibly de-duping identical chunks) and re-sorts based on an overall relevance score.
+
+4. **Contextual Chunking**  
+   - Prepending or generating short chunk-specific context (à la Anthropic’s “Contextual Embeddings”) can further improve recall by clarifying which function, file, or domain the chunk belongs to.
+
+---
+
+### 8.2 Proposed Changes
+
+1. **Dual Indexing**  
+   - **BM25**: Build a token-based index using BM25 or a similar lexical approach.  
+     - Store each chunk’s text in RxDB, ensuring you maintain a text-search index (RxDB can store and index short documents, though you may need an external library or manually implement BM25-like logic).  
+   - **Embedding**: Continue storing the chunk embeddings (raw code, commentary, or contextual expansions) in the RxDB documents as vectors for quick nearest-neighbor queries.  
+     - Depending on performance and your data size, you might store the vector in RxDB directly or integrate with an external library that can handle approximate nearest neighbor (ANN) lookups.  
+
+2. **Query Flow**  
+   - **(A) Lexical Search**: Given a user query, run a BM25 text match in RxDB.  
+   - **(B) Embedding Search**: Generate an embedding of the query, then do a semantic search for top-K results from your stored vectors.  
+   - **(C) Rank Fusion**: Merge both result sets.  
+     - One approach:  
+       1. For each chunk, maintain two scores: `semanticScore` (from embedding similarity), `lexicalScore` (from BM25).  
+       2. Combine them (e.g., weighted sum, or prioritize whichever is highest).  
+       3. Sort the merged list by the combined score.  
+   - **(D) Truncate** to the final top-K (or top-K + reference expansions) before forming the `<codeRag:chunk>` response.
+
+3. **Contextual Retrieval** (Optional Enhancement)  
+   - When indexing each file, generate an additional “context snippet” that clarifies which project, file, or functional domain the code belongs to—especially if the chunk is small or ambiguous.  
+   - Prepend that snippet to the code before embedding, and also store it for BM25 indexing.  
+   - This step helps ensure code references (like “this function belongs to the concurrency module of Project X”) are accessible for both semantic and lexical searches.
+
+---
+
+### 8.3 Implementation Notes with RxDB
+
+1. **Chunk Schema**  
+   - Each chunk entry in RxDB might look like:
+     ```js
+     {
+       _id: <chunkId>,
+       filepath: <string>,
+       codeContent: <string>,
+       commentary: <string>,
+       references: [<string>],
+       embeddingVector: [<number>], // e.g., float array
+       lexicalTokens: <string>,     // full or partial text for BM25
+       // ...
+     }
+     ```
+   - This schema allows for:
+     - Full-text or token-based indexing for BM25 logic.
+     - Storing the chunk’s embedding vector in a field (`embeddingVector`).
+
+2. **BM25 in RxDB**  
+   - RxDB doesn’t natively implement BM25.  
+   - Potential solutions:
+     1. **Plugin/Module**: Implement or integrate a library that can do a BM25 pass over the chunk’s `lexicalTokens`.  
+     2. **Custom Logic**: Export the chunk data, run BM25 offline or in-memory, then store the results or partial indexes back in RxDB.
+
+3. **Embeddings**  
+   - While you *can* store embeddings in RxDB, you may also want an external nearest-neighbor index if dealing with large-scale codebases.  
+   - For an MVP or smaller repositories, a direct RxDB approach with a scanning similarity search could be enough. Indexing can be refined later as scale grows.
+
+4. **Rank Fusion**  
+   - Keep your logic for merging BM25 and embedding hits in a dedicated function or microservice. This ensures you can tweak the weighting strategy or add advanced re-ranking (e.g., with a second LLM pass) as you evolve.
+
+---
+
+### 8.4 Example Flow
+
+**Indexing**  
+1. Parse chunk → store chunk text & optional context snippet in `lexicalTokens`.  
+2. Generate code & commentary embeddings → store in `embeddingVector`.  
+3. Insert into RxDB.
+
+**Querying**  
+1. **Lexical**: BM25 on `lexicalTokens` → get top-10 lexical matches.  
+2. **Semantic**: Embed user query → find top-10 embedding matches.  
+3. **Merge**: Combine & de-dupe chunk IDs from both sets.  
+4. **Score**: For each chunk, compute a final relevance score, e.g. `weightedSum = 0.5 * lexicalScore + 0.5 * semanticScore`.  
+5. **Sort**: Sort descending by final score.  
+6. **Reference expansions** (optional).  
+7. **Output**: Format the final list as `<codeRag:chunk>` blocks.
+
+---
+
+### 8.5 Conclusion
+
+By augmenting `codeRag` with a **hybrid search** approach—**BM25** plus **embeddings**—and optionally using short contextual expansions, you achieve:
+
+- More robust handling of code-specific identifiers.  
+- Maintained coverage for conceptual or high-level queries.  
+- A flexible design that scales from small single repos (pure RxDB, scanning-based approach) to large, multi-repo contexts (external ANN index, advanced rank fusion, etc.).
+
+This hybrid approach complements the existing `codeRag` specification, refining it to excel in code retrieval scenarios that demand both **semantic** *and* **literal** matches. 
